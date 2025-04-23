@@ -18,7 +18,6 @@ import proto
 
 load_dotenv()
 genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-gemini_client = generativeai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 def remove_key(container, key):
     if type(container) is dict:

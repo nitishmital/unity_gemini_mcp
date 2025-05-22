@@ -1,184 +1,40 @@
-
-
 import asyncio
+import sys
+from mcp_core import MCPCore
+from gui_client import MCPGui
 
-from google.genai.types import GenerateContentConfig
-from google.protobuf.json_format import MessageToJson, MessageToDict
-from mcp import ClientSession, StdioServerParameters
-from dotenv import load_dotenv
-import os
-from google import genai as generativeai
-import google.generativeai as genai
-from google.generativeai import types, GenerationConfig
-from mcp.client.stdio import stdio_client
-from typing import Optional
-from contextlib import AsyncExitStack
-
-import proto
-
-load_dotenv()
-genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-
-def remove_key(container, key):
-    if type(container) is dict:
-        if key in container:
-            del container[key]
-        for v in container.values():
-            remove_key(v, key)
-    if type(container) is list:
-        for v in container:
-            remove_key(v, key)
-
-class MCPClient:
-    def __init__(self):
-        # Initialize session and client objects
-        self.session: Optional[ClientSession] = None
-        self.exit_stack = AsyncExitStack()
-
-    async def connect_to_server(self, server_script_path: str):
-        """Connect to an MCP server
-
-        Args:
-            server_script_path: Path to the server script (.py or .js)
-        """
-        is_python = server_script_path.endswith('.py')
-        is_js = server_script_path.endswith('.js')
-        if not (is_python or is_js):
-            raise ValueError("Server script must be a .py or .js file")
-
-        command = "python" if is_python else "node"
-        server_params = StdioServerParameters(
-            command=command,
-            args=[server_script_path],
-            env=None
-        )
-
-        stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-        self.stdio, self.write = stdio_transport
-        self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
-
-        await self.session.initialize()
-
-        # List available tools
-        response = await self.session.list_tools()
-        tools = response.tools
-        print("\nConnected to server with tools:", [tool.name for tool in tools])
-
-    async def process_query(self, query: str, response) -> str:
-        """Process a query using Gemini and available tools"""
-
-        prompt = query
-        #response = await self.session.list_tools()
-        #print(response)
-        for tool in response.tools:
-            remove_key(tool.inputSchema, "title")
-            remove_key(tool.inputSchema, "default")
-            remove_key(tool.inputSchema, "additionalProperties")
-
-        available_tools = [
-            types.Tool(
-                function_declarations=[
-                    types.FunctionDeclaration(
-                        name=tool.name,
-                        description=tool.description,
-                        parameters=tool.inputSchema
-                    )
-                ]
-            )
-            for tool in response.tools
-        ]
-        # Gemini API call
-        generation_config = GenerationConfig(temperature=0.8)
-        assistant_message_content = prompt + "\n"
-        model = genai.GenerativeModel('models/gemini-2.0-flash')
-        for i in range(10):
-            response = model.generate_content(
-                contents=assistant_message_content,
-                tools=available_tools,
-                generation_config=generation_config
-            )
-            #print(response)
-            # Process response and handle tool calls
-            for candidate in response.candidates:
-                for part in candidate.content.parts:
-                    if part.text:
-                        print(part.text)
-                        assistant_message_content = assistant_message_content + "AI response: " + part.text + "\n"
-                    elif part.function_call:
-                        function = proto.Message.to_dict(part.function_call)
-                        print("function: ", function)
-                        tool_name = function["name"]
-                        tool_args = function["args"]  # This is a dictionary
-                        #print(f"Calling function: {tool_name} with args: {tool_args}")
-                        # Execute tool call
-                        result = await self.session.call_tool(tool_name, tool_args)
-                        print("Unity MCP server response: ", result.content[0].text)
-                        assistant_message_content = assistant_message_content + "Unity MCP response: " + result.content[0].text + "\n"
-                        # Get next response from Gemini
-                        response = model.generate_content(
-                            contents=assistant_message_content,
-                            tools=available_tools,
-                            generation_config=generation_config
-                            )
-                        #print('second response: ', response.candidates[0].content)
-                        assistant_message_content = assistant_message_content + response.candidates[0].content.parts[0].text + "\n"
-                        if 'exit' in response.candidates[0].content.parts[0].text.lower() or '\nexit' in response.candidates[0].content.parts[0].text.lower():
-                            print("***************** Success. Exiting. **************************")
-                            return assistant_message_content
-
-        return assistant_message_content
-
-    async def chat_loop(self):
-        """Run an interactive chat loop"""
-        print("\nMCP Client Started!")
-        print("Type your queries or 'quit' to exit.")
-        response = ""
-        start = 0
-        tools = None
-        while True:
-            try:
-                system_prompt = '''System prompt: Your overall task is to answer the query or task specified by the user within the Unity game-engine. To do that you are provided with a list of tools from the Model Context Protocol for Unity Game Engine. After each step, you will be provided with the result of your action. Check if the action taken indeed resulted in the task being accomplished. If yes, output 'EXIT', else output 'Continue'. If you continue, try different approaches to find the solution. If you do not find an answer, just exit. Do not try to make up an answer.\n Query: '''
-
-                query = input("\nQuery: ").strip()
-                if query.lower() == 'quit':
-                    break
-                if start==0:
-                    tools = await self.session.list_tools()
-                    query = "\n Tools from Model Context Protocol: " + str(tools) + "\n" + system_prompt + query
-                    start = start + 1
-                else:
-                    query = "Query: " + query
-
-                response = await self.process_query(response + '\n' + query, response=tools)
-                print("\n" + response)
-
-            except Exception as e:
-                print(f"\nError: {str(e)}")
-
-    async def cleanup(self):
-        """Clean up resources"""
-        await self.exit_stack.aclose()
-
-async def main():
+def main():
     if len(sys.argv) < 2:
-        print("Usage: python client.py <path_to_server_script>")
+        print("Usage: python gemini_mcp_client.py <path_to_server_script> [--gui]")
         sys.exit(1)
 
-    client = MCPClient()
+    use_gui = "--gui" in sys.argv
+    server_script = sys.argv[1]
+    core = MCPCore()
+
+    if use_gui:
+        gui = MCPGui(server_script)
+        gui.run()
+    else:
+        asyncio.run(async_cli_main(server_script, core))
+
+async def async_cli_main(server_script: str, core: MCPCore):
     try:
-        await client.connect_to_server(sys.argv[1])
-        await client.chat_loop()
+        connected = await core.connect(server_script)
+        if not connected:
+            print("Failed to connect to MCP server")
+            return
+
+        print("MCP Client Started! Type 'quit' to exit.")
+        while True:
+            query = input("\nQuery: ").strip()
+            if query.lower() == 'quit':
+                break
+                
+            response = await core.process_request(query)
+            print("\nResponse:", response)
     finally:
-        await client.cleanup()
+        await core.cleanup()
 
 if __name__ == "__main__":
-    import sys
-    asyncio.run(main())
-
-
-##############################################################################################
-
-'''
-Create 5 copies of existing gameobject which has the tag bush, and place them on top of the existing gameobject which has the tag zsu23
-
-'''
+    main()

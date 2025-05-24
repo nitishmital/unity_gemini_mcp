@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Gemini MCP Web Interface</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+
+<body>
+    <div class="container">
+        <h1>Gemini MCP Chat</h1>
+        <div id="chat"></div>
+        <div class="input-area">
+            <input type="text" id="messageInput" placeholder="Type your message...">
+            <button onclick="sendMessage()">Send</button>
+        </div>
+    </div>
+
+    <script>
+        const serverScript = new URLSearchParams(window.location.search).get('script') || 'default_server.py';
+        const ws = new WebSocket(`ws://${window.location.host}/ws/${serverScript}`);
+        const chat = document.getElementById('chat');
+        const messageInput = document.getElementById('messageInput');
+
+        ws.onmessage = function (event) {
+            addMessage('Assistant', event.data);
+        };
+
+        function addMessage(sender, text) {
+            const div = document.createElement('div');
+            div.className = `message ${sender.toLowerCase()}`;
+            div.textContent = `${sender}: ${text}`;
+            chat.appendChild(div);
+            chat.scrollTop = chat.scrollHeight;
+        }
+
+        function sendMessage() {
+            const message = messageInput.value.trim();
+            if (message) {
+                ws.send(message);
+                addMessage('You', message);
+                messageInput.value = '';
+            }
+        }
+
+        messageInput.addEventListener('keypress', function (e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+    </script>
+</body>
+
+</html>

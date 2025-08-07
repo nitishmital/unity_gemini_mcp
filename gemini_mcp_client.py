@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import os
 from mcp_core import MCPCore
 from gui_client import MCPGui
 from web_server import app
@@ -7,13 +8,16 @@ import uvicorn
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python gemini_mcp_client.py <path_to_server_script> [--gui|--web]")
-        sys.exit(1)
-
-    server_script = sys.argv[1]
+        # Default to the existing Unity MCP server
+        server_script = "/usr/local/bin/UnityMCP/UnityMcpServer/src/server.py"
+        print(f"Using default Unity MCP server: {server_script}")
+    else:
+        server_script = sys.argv[1]
+    
     mode = next((arg for arg in sys.argv if arg in ['--gui', '--web']), '')
 
     if mode == '--web':
+        os.environ['UNITY_SERVER_SCRIPT'] = os.path.abspath(server_script)
         uvicorn.run(app, host="0.0.0.0", port=8000)
     elif mode == '--gui':
         gui = MCPGui(server_script)

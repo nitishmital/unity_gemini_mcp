@@ -17,14 +17,12 @@
     </div>
 
     <script>
-        const serverScript = new URLSearchParams(window.location.search).get('script') || 'default_server.py';
-        const ws = new WebSocket(`ws://${window.location.host}/ws/${serverScript}`);
         const chat = document.getElementById('chat');
         const messageInput = document.getElementById('messageInput');
 
-        ws.onmessage = function (event) {
-            addMessage('Assistant', event.data);
-        };
+        // Get the server script path and handle missing parameter
+        const urlParams = new URLSearchParams(window.location.search);
+        const serverScript = urlParams.get('script');
 
         function addMessage(sender, text) {
             const div = document.createElement('div');
@@ -36,18 +34,39 @@
 
         function sendMessage() {
             const message = messageInput.value.trim();
-            if (message) {
+            if (message && ws.readyState === WebSocket.OPEN) {
                 ws.send(message);
                 addMessage('You', message);
                 messageInput.value = '';
             }
         }
 
-        messageInput.addEventListener('keypress', function (e) {
+        // Handle enter key globally
+        messageInput.addEventListener('keydown', function (e) {
             if (e.key === 'Enter') {
+                e.preventDefault(); // Prevent default form submission
                 sendMessage();
             }
         });
+
+        if (!serverScript) {
+            addMessage('System', 'Error: No server script specified. Use ?script=/path/to/server.py in URL');
+        } else {
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/${encodeURIComponent(serverScript)}`);
+
+            ws.onopen = function () {
+                addMessage('System', 'Connecting to server...');
+            };
+
+            ws.onerror = function (error) {
+                addMessage('System', `WebSocket error: ${error.message || 'Unknown error'}`);
+            };
+
+            ws.onmessage = function (event) {
+                addMessage('Assistant', event.data);
+            };
+        }
     </script>
 </body>
 

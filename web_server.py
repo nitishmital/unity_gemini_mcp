@@ -1,10 +1,11 @@
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 import asyncio
 from mcp_core import MCPCore
 import uvicorn
 import os
+from urllib.parse import unquote
 
 app = FastAPI()
 
@@ -16,8 +17,13 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 @app.get("/")
 async def get():
+    script_path = os.getenv('UNITY_SERVER_SCRIPT', '')
     with open("templates/index.html") as f:
-        return HTMLResponse(f.read())
+        html = f.read()
+        return HTMLResponse(html.replace(
+            'const serverScript = urlParams.get(\'script\');',
+            f'const serverScript = urlParams.get(\'script\') || "{script_path}";'
+        ))
 
 @app.websocket("/ws/{server_script}")
 async def websocket_endpoint(websocket: WebSocket, server_script: str):
@@ -25,7 +31,15 @@ async def websocket_endpoint(websocket: WebSocket, server_script: str):
     core = MCPCore()
     
     try:
-        connected = await core.connect(server_script)
+        script_path = unquote(server_script)
+        if not os.path.isabs(script_path):
+            script_path = os.path.abspath(script_path)
+            
+        if not os.path.isfile(script_path):
+            await websocket.send_text(f"Error: Server script not found at {script_path}")
+            return
+
+        connected = await core.connect(script_path)
         if not connected:
             await websocket.send_text("Failed to connect to MCP server")
             return
@@ -36,9 +50,13 @@ async def websocket_endpoint(websocket: WebSocket, server_script: str):
             query = await websocket.receive_text()
             if query.lower() == 'quit':
                 break
+            
+            try:
+                response = await core.process_request(query)
+                await websocket.send_text(response)
+            except Exception as e:
+                await websocket.send_text(f"Error processing request: {str(e)}")
                 
-            response = await core.process_request(query)
-            await websocket.send_text(response)
     except Exception as e:
         await websocket.send_text(f"Error: {str(e)}")
     finally:

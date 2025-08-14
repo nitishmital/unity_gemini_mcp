@@ -13,7 +13,7 @@ from PIL import Image
 import io
 import json
 from datetime import datetime
-
+import asyncio
 load_dotenv()
 genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
 
@@ -35,6 +35,9 @@ class ReActAgent:
     
     TOOL_SCHEMAS = """
     MCP Tool Schemas:
+    - observe_scene: {"step": int} - Render and analyze the current Unity scene. Use this tool whenever you need to see the current state of the scene before or after an action.
+    - scene_info: {"name": str, "path": str} - Get complete scene information including hierarchy, objects, and their properties. Use this tool when you need to understand the current scene structure, object names, positions, and properties.
+    - ask_user: {} - Ask user for a suggestion on how to proceed. Use this tool when you are stuck and not able to understand what steps to perform next, or when consistently unable to get successful responses from the server.
     - manage_gameobject: {"action": "create|find|add_component|modify", "name": str, "position": {"x": float, "y": float, "z": float}, ...}
     - manage_editor: {"action": "play|stop|pause|resume"}
     - execute_menu_item: {"menu_path": str}
@@ -50,12 +53,95 @@ class ReActAgent:
         self.max_steps = 20
         self.current_step = 0
         self.goal = ""
-        self.vision_model = genai.GenerativeModel('models/gemini-2.0-flash')
+        self.vision_model = genai.GenerativeModel('models/gemini-2.5-flash')
         self.reasoning_model = genai.GenerativeModel('models/gemini-2.5-flash')
         self.function_call_model = genai.GenerativeModel('models/gemini-2.5-flash')  # Dedicated model for function call generation
         self.last_scene_path = None
+        # Register tools including observe_scene
+        self._register_tools()
         
-    def create_react_prompt(self, observation: str, last_action: Optional[Dict] = None) -> str:
+    def _register_tools(self):
+        """Register all available tools, including observe_scene and scene_info, for the agent."""
+        from google.generativeai.types import Tool, FunctionDeclaration
+        
+        # Create the observe_scene tool
+        observe_scene_tool = Tool(
+            function_declarations=[
+                FunctionDeclaration(
+                    name="observe_scene",
+                    description=(
+                        "Render the current Unity scene and return a visual/textual observation. "
+                        "Use this tool whenever you need to see the current state of the scene before or after an action. "
+                        "This tool will capture the scene, analyze it, and return a summary of visible objects, their positions, colors, and states. "
+                        "Call this tool whenever you need to verify the effect of an action or plan your next step."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "step": {
+                                "type": "integer", 
+                                "description": "The step number for which to observe the scene."
+                            }
+                        },
+                        "required": ["step"]
+                    }
+                )
+            ]
+        )
+        
+        # Create the scene_info tool
+        scene_info_tool = Tool(
+            function_declarations=[
+                FunctionDeclaration(
+                    name="scene_info",
+                    description=(
+                        "Get complete scene information including hierarchy, objects, and their properties. "
+                        "This tool specifically calls manage_scene with action='get_hierarchy' and build_index=0 "
+                        "to retrieve comprehensive scene information in a reliable way. "
+                        "Use this tool when you need to understand the current scene structure, object names, positions, and properties."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Scene name (no extension). Defaults to 'SampleScene'."
+                            },
+                            "path": {
+                                "type": "string", 
+                                "description": "Asset path for scene operations. Defaults to '/'."
+                            }
+                        },
+                        "required": []
+                    }
+                )
+            ]
+        )
+
+        # Create the scene_info tool
+        ask_user_tool = Tool(
+            function_declarations=[
+                FunctionDeclaration(
+                    name="ask_user",
+                    description=(
+                        "Get input from user for a suggestion for next steps. "
+                        "This tool specifically asks the user for an prompt in between steps. "
+                        "Use this tool when you feel stuck or unable to get successful responses from the MCP server, and need help figuring out what to do."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                        },
+                        "required": []
+                    }
+                )
+            ]
+        )
+        
+        # Combine with existing MCP tools
+        self.available_tools = [observe_scene_tool, scene_info_tool, ask_user_tool] + self.mcp_core.available_tools
+    
+    def create_react_prompt(self, observation: str = "", last_action: Optional[Dict] = None) -> str:
         """Create a ReAct-style prompt with memory and current state."""
         memory_str = ""
         if self.memory:
@@ -72,12 +158,11 @@ class ReActAgent:
             last_action_str = f"\nLast Action: {last_action.get('action', 'N/A')}\nLast Result: {last_action.get('result', 'N/A')}\n"
         
         # Build the prompt using string concatenation to avoid formatting issues
-        #print("Tools: ", self.mcp_core.tools)
         tools_str = str(self.mcp_core.tools) if hasattr(self.mcp_core, 'tools') else "No tools available"
         
         prompt = f'''You are a ReAct-style reasoning agent for Unity scene manipulation. Your goal is to: {self.goal}
 
-Current Observation: {observation}
+Current Observation: {observation if observation else "No current observation - use observe_scene tool to see the current state"}
 {last_action_str}{memory_str}
 
 {self.TOOL_SCHEMAS}
@@ -91,31 +176,141 @@ Observation: [Wait for the result]
 Note that in your previous runs, you have used the wrong path to search for or create gameobjects or components. You used the 
 path Assets/ , but that actually takes you to the path Assets/Assets/ since you are already within the root Assets/ directory.
 Therefore, use the path / instead.
-Available MCP Tools: {tools_str}
+
+Available MCP Tools: {tools_str}. Use the schemas of the tools as specified.
 
 Guidelines:
 - ALWAYS start with "Thought:" to explain your reasoning
-- ALWAYS include "Action:" with the specific tool call you want to make
+- ALWAYS include "Action:" with the text action and the specific tool call you want to make
+- Use the observe_scene tool whenever you need to see the current state of the scene
+- Use the scene_info tool when you need to understand the scene structure, object names, positions, and properties
 - Use precise coordinates and object names
 - If an action fails, reflect on why and try a different approach
-- If the goal appears achieved, use vision to verify
+- Use observe_scene to verify the effect of an action which is likely to have a visual effect or can only be interpreted visually.
+- Use scene_info if the effect of the action can be ascertained from the scene hierarchy, like modification of object position, rotation, scale, color, etc.
+- If the goal appears achieved, use observe_scene to verify
 - Be systematic and methodical in your approach
 - Consider the full context of previous actions and their results
+- Break down complex tasks into smaller, manageable steps
+- Use chain-of-thought reasoning to plan multi-step operations
 
-EXAMPLE RESPONSE FORMAT:
-Thought: I need to create a red cube in the scene. Looking at the current observation, I can see the scene is empty, so I should start by creating a cube GameObject.
-Action: manage_gameobject(action="create", name="RedCube", position={{"x": 0, "y": 0.5, "z": 0}}) 
+EXAMPLE RESPONSE FORMATS:
+
+**Simple Task Example:**
+Thought: I need to see the current state of the scene before planning my next action.
+Action: observe_scene(step=1)
 Function call: (Generate the function call to implement the above Action)
 Observation: [Wait for the result]
+
+Thought: I need to understand the scene structure to see what objects exist.
+Action: scene_info(name="SampleScene", path="/")
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: I need to create a red cube in the scene. Looking at the current observation, I can see the scene is empty, so I should start by creating a cube GameObject.
+Action: manage_gameobject(action="create", name="RedCube", position={{"x": 0, "y": 0.5, "z": 0}})
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+**Complex Multi-Step Task Example - Creating a Scene with Multiple Objects:**
+Thought: I need to create a scene with a red cube on top of a green platform. This is a multi-step task that requires: 1) First understanding the current scene, 2) Creating the platform, 3) Creating the cube, 4) Positioning the cube on top of the platform. Let me start by observing the current scene.
+Action: observe_scene(step=1)
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: Now I need to get detailed scene information to understand the current structure and see if there are any existing objects I need to work with.
+Action: scene_info(name="SampleScene", path="/")
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: Based on the scene information, I can see the scene is mostly empty. I need to create a green platform first. I'll create a cube GameObject and then modify its material to make it green. Let me start by creating the platform cube.
+Action: manage_gameobject(action="create", name="GreenPlatform", position={{"x": 0, "y": 0, "z": 0}})
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: Now I need to make the platform green. I'll modify the MeshRenderer component to change the material color to green.
+Action: manage_gameobject(action='modify', name='GreenPlatform', component_properties={{'MeshRenderer': {{'sharedMaterial.color': [0, 1, 0, 1]}}}}) 
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: Now I need to create the red cube that will go on top of the platform. I'll position it slightly above the platform.
+Action: manage_gameobject(action="create", name="RedCube", position={{"x": 0, "y": 1.5, "z": 0}})
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: Now I need to make the cube red by modifying its material color.
+Action: manage_gameobject(action="modify", name="RedCube", component_properties={{'MeshRenderer': {{'sharedMaterial.color': [1, 0, 0, 1]}}}})
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: Let me verify that the scene looks correct by observing it again to make sure the red cube is properly positioned on top of the green platform.
+Action: observe_scene(step=2)
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: I see that the red cube is hovering over the green platform. Let me try to move the red cube in a small step towards the green platform to understand how the numerical movements scale visually.
+Action: manage_gameobject(action="modify", name="RedCube", position={{"x": 2, "y": 0.9, "z": 0}})
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: Let me verify that the scene looks correct by observing it again to make sure the red cube is properly positioned on top of the green platform.
+Action: observe_scene(step=4)
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: I see that the red cube is still hovering over the green platform, but is closer than before. It means that reducing the y value brings the red cube closer to the green platform.
+ Let me try to move the red cube another small step towards the green platform.
+Action: manage_gameobject(action="modify", name="RedCube", position={{"x": 2, "y": 0.8, "z": 0}})
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: Let me verify that the scene looks correct by observing it again to make sure the red cube is properly positioned on top of the green platform.
+Action: observe_scene(step=6)
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+**Complex Task Example - Modifying Existing Objects:**
+Thought: I need to move the red cube to a new position and change its color to blue. This requires: 1) First finding the existing cube, 2) Modifying its position, 3) Changing its color. Let me start by getting scene information to locate the cube.
+Action: scene_info(name="SampleScene", path="/")
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: I can see there's a RedCube in the scene. Now I need to move it to a new position. I'll modify its transform to move it to coordinates (2, 1, 0).
+Action: manage_gameobject(action="modify", name="RedCube", position={{"x": 2, "y": 1, "z": 0}})
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: Now I need to change the cube's color from red to blue. I'll modify the MeshRenderer component's material color.
+Action: manage_gameobject(action="modify", name="RedCube", component_properties={{'MeshRenderer': {{'sharedMaterial.color': [0, 0, 1, 1]}}}})
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: Let me verify the changes by observing the scene to make sure the cube has been moved and its color changed to blue.
+Action: observe_scene(step=3)
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+**Error Handling Example:**
+Thought: I tried to create a cube but it seems like the action failed. Let me check the scene information to see what might have gone wrong and if the cube was actually created.
+Action: scene_info(name="SampleScene", path="/")
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+Thought: I can see the cube wasn't created. Let me try a different approach - maybe the name was already taken or there was an issue with the parameters. I'll try creating it with a different name and simpler parameters.
+Action: manage_gameobject(action="create", name="TestCube", position={{"x": 0, "y": 0, "z": 0}})
+Function call: (Generate the function call to implement the above Action)
+Observation: [Wait for the result]
+
+The Unity scene uses an HDRP renderer, so all materials should have the HDRP/Lit shader. 
 
 Begin your reasoning:'''
         return prompt
     
     async def observe_scene(self, step=0) -> str:
-        """Capture current scene state through rendering and analysis."""
+        """Render and analyze the current Unity scene as a tool."""
         try:
             # Render current scene
-            scene_path = f"/Users/nmital/Unity projects/MCP_builder/step_{self.current_step}_scene.png"
+            scene_path = f"/Users/nmital/Unity projects/MCP_builder/step_{step}_scene.png"
             self.last_scene_path = scene_path
             success = await self.mcp_core.render_scene(scene_path)
             if not success:
@@ -124,29 +319,52 @@ Begin your reasoning:'''
             with open(scene_path, "rb") as img_file:
                 img_data = img_file.read()
             img_part = {"mime_type": "image/png", "data": base64.b64encode(img_data).decode()}
-            analysis_prompt = f"""Analyze this Unity scene image and describe what you see.
-
-Goal: {self.goal}
-
-Please describe:
-1. What objects are visible in the scene?
-2. What are their positions, colors, and states?
-3. How does this relate to the goal: {self.goal}?
-4. What needs to be changed to achieve the goal?
-
-Provide a clear, detailed observation that will help plan the next action."""
+            analysis_prompt = f"""Analyze this Unity scene image and describe what you see.\n\nGoal: {self.goal}\n\nPlease describe:\n1. What objects are visible in the scene?\n2. What are their positions, colors, and states?\n3. How does this relate to the goal: {self.goal}?\n4. What needs to be changed to achieve the goal?\n\nProvide a clear, detailed observation that will help plan the next action."""
             response = self.vision_model.generate_content([analysis_prompt, img_part])
             return response.text
         except Exception as e:
             return f"Error observing scene: {str(e)}"
+
+    async def ask_user(self) -> str:
+        """Ask user to provide a nudge in the correct or a desired direction of reasoning."""
+        try:
+            # Take Input from user
+            print("\n🎯 I am stuck. Please suggest some ideas if you have of how I can proceed:")
+            user_nudge = input("> ").strip()
+            return user_nudge
+        except Exception as e:
+            return f"Error in user input: {str(e)}"
+    
+    async def scene_info(self, name: str = "SampleScene", path: str = "/") -> str:
+        """Get complete scene information including hierarchy, objects, and their properties."""
+        try:
+            # Call manage_scene with specific parameters for getting hierarchy
+            params = {
+                "action": "get_hierarchy",
+                "name": name,
+                "path": path,
+                "build_index": 0
+            }
+            
+            # Send command to Unity via MCP
+            tool_response = await self.mcp_core.session.call_tool("manage_scene", params)
+            
+            if tool_response and tool_response.content:
+                response_text = tool_response.content[0].text
+                return f"Scene information retrieved successfully:\n{response_text}"
+            else:
+                return "Failed to retrieve scene information - no response from manage_scene tool"
+                
+        except Exception as e:
+            return f"Error retrieving scene info: {str(e)}"
     
     async def reflect_on_result(self, action: str, result: str, observation: str) -> str:
         """Use LLM to reflect on the action result and plan next steps."""
-        reflection_prompt = f"""Reflect on the recent action and its result:
+        reflection_prompt = f"""Reflect on the latest action and its result in context of the previous actions:
 
 Goal: {self.goal}
-Action taken: {action}
-Result: {result}
+Latest action taken: {action}
+Result of latest action: {result}
 Current observation: {observation}
 
 Previous actions: {json.dumps(self.memory[-3:], indent=2) if self.memory else "None"}
@@ -166,16 +384,19 @@ Provide a brief reflection that will guide the next action:"""
         """Check if the goal has been achieved using vision analysis."""
         try:
             scene_path = self.last_scene_path or self.mcp_core.modified_scene_path
-            if not os.path.exists(scene_path):
-                return False
-            with open(scene_path, "rb") as img_file:
-                img_data = img_file.read()
-            img_part = {"mime_type": "image/png", "data": base64.b64encode(img_data).decode()}
-            goal_check_prompt = f"""Analyze this Unity scene and determine if the goal has been achieved.
+            '''if not os.path.exists(scene_path):
+                return False'''
+            if os.path.exists(scene_path):
+                with open(scene_path, "rb") as img_file:
+                    img_data = img_file.read()
+                img_part = {"mime_type": "image/png", "data": base64.b64encode(img_data).decode()}
+            else:
+                img_part = None
+            goal_check_prompt = f"""Analyze the Unity scene and determine if the goal has been achieved.
 
 Goal: {self.goal}
-
-Question: Does this scene show that the goal has been successfully completed?
+Observation and reflection: {observation}
+Question: Has goal has been successfully completed?
 
 Please respond with:
 - "GOAL_ACHIEVED" if the goal is clearly completed
@@ -249,6 +470,7 @@ Provide a brief explanation for your assessment."""
                         
                         try:
                             tool_response = await self.mcp_core.session.call_tool(tool_name, tool_args)
+                            await asyncio.sleep(2)  # Give time for modification to complete
                             if tool_response and tool_response.content:
                                 response_text = tool_response.content[0].text
                                 print(f"   ✅ Tool Response: {response_text}")
@@ -274,10 +496,6 @@ Provide a brief explanation for your assessment."""
             # Extract text content from response
             text_content = self._extract_response_text(response)
             
-            # If no text content, return error
-            '''if not text_content or text_content == "No text content found in response":
-                return "No valid response generated" '''
-            
             # Check for function calls in the response
             candidates = getattr(response, 'candidates', [])
             function_call_found = False
@@ -301,19 +519,44 @@ Provide a brief explanation for your assessment."""
                                 tool_name = getattr(part.function_call, 'name', 'unknown')
                                 tool_args = getattr(part.function_call, 'args', {})
                             
-                            # Execute the tool
-                            try:
-                                tool_response = await self.mcp_core.session.call_tool(tool_name, tool_args)
-                                if tool_response and tool_response.content:
-                                    response_text = tool_response.content[0].text
-                                    return f"{text_content}\n\nTool executed: {tool_name}\nTool response: {response_text}"
-                                else:
-                                    return f"{text_content}\n\nTool executed: {tool_name}\nTool response: No response"
-                            except Exception as e:
-                                return f"{text_content}\n\nTool execution error: {str(e)}"
+                            # Handle observe_scene tool specifically
+                            if tool_name == "observe_scene":
+                                try:
+                                    step = tool_args.get("step", self.current_step)
+                                    observation_result = await self.observe_scene(step=step)
+                                    return f"{text_content}\n\nScene observation completed:\n{observation_result}"
+                                except Exception as e:
+                                    return f"{text_content}\n\nScene observation error: {str(e)}"
+                            
+                            # Handle scene_info tool specifically
+                            elif tool_name == "scene_info":
+                                try:
+                                    name = tool_args.get("name", "SampleScene")
+                                    path = tool_args.get("path", "/")
+                                    scene_info_result = await self.scene_info(name=name, path=path)
+                                    return f"{text_content}\n\nScene information retrieved:\n{scene_info_result}"
+                                except Exception as e:
+                                    return f"{text_content}\n\nScene info error: {str(e)}"
+                            
+                            # Execute other MCP tools
+                            else:
+                                try:
+                                    tool_response = await self.mcp_core.session.call_tool(tool_name, tool_args)
+                                    await asyncio.sleep(2)  # Give time for tool to execute
+                                    if tool_response and tool_response.content:
+                                        response_text = tool_response.content[0].text
+                                        return f"{text_content}\n\nTool executed: {tool_name}\nTool response: {response_text}"
+                                    else:
+                                        return f"{text_content}\n\nTool executed: {tool_name}\nTool response: No response"
+                                except Exception as e:
+                                    return f"{text_content}\n\nTool execution error: {str(e)}"
+            
+            # If no function call found, try to parse action from text
             if not function_call_found:
                 action = await self._convert_text_action_to_function_call(text_content)
-                action_response = await self.execute_action(action)
+                if action:
+                    action_response = await self.execute_action(action)
+                    return f"{text_content}\n\nParsed and executed action: {action_response}"
             
             # If no function calls and no parsable action, just return the text content
             return text_content
@@ -327,7 +570,7 @@ Provide a brief explanation for your assessment."""
             # Check for safety ratings first
             candidates = getattr(response, 'candidates', [])
             if not candidates:
-                return "No text content found in response"
+                return "" #"No text content found in response"
             
             candidate = candidates[0]
             safety_ratings = getattr(candidate, 'safety_ratings', [])
@@ -339,11 +582,11 @@ Provide a brief explanation for your assessment."""
             # Try to extract text content
             content = getattr(candidate, 'content', None)
             if not content:
-                return "No text content found in response"
+                return "" #"No text content found in response"
             
             parts = getattr(content, 'parts', [])
             if not parts:
-                return "No text content found in response"
+                return "" #"No text content found in response"
             
             text_parts = []
             for part in parts:
@@ -357,7 +600,7 @@ Provide a brief explanation for your assessment."""
             if hasattr(response, 'text'):
                 return response.text
             
-            return "No text content found in response"
+            return "" #"No text content found in response"
             
         except Exception as e:
             return "Error extracting response text"
@@ -415,7 +658,7 @@ Generate the function call for the above text action:"""
             # Generate function call using the dedicated model
             response = self.function_call_model.generate_content(
                 contents=function_call_prompt,
-                tools=self.mcp_core.available_tools,
+                tools=self.available_tools,
                 generation_config=GenerationConfig(
                     temperature=0.3,  # Low temperature for consistent output
                     max_output_tokens=500,
@@ -428,6 +671,82 @@ Generate the function call for the above text action:"""
             print(f"Error converting to function call: {e}")
             return None
     
+    def _extract_thought_and_action(self, response_text: str) -> tuple[str, str]:
+        """Extract thought and action from LLM response text."""
+        thought = ""
+        action = ""
+        
+        if not response_text:
+            return thought, action
+        
+        # Parse the response text for thoughts and actions
+        lines = response_text.split('\n')
+        current_section = None
+        current_content = []
+        
+        for line in lines:
+            line = line.strip()
+            
+            # Check for section headers
+            if line.startswith('Thought:'):
+                # Save previous section if exists
+                if current_section == 'thought' and current_content:
+                    thought = ' '.join(current_content).strip()
+                elif current_section == 'action' and current_content:
+                    action = ' '.join(current_content).strip()
+                
+                # Start new thought section
+                current_section = 'thought'
+                current_content = [line.replace('Thought:', '').strip()]
+                
+            elif line.startswith('Action:'):
+                # Save previous section if exists
+                if current_section == 'thought' and current_content:
+                    thought = ' '.join(current_content).strip()
+                elif current_section == 'action' and current_content:
+                    action = ' '.join(current_content).strip()
+                
+                # Start new action section
+                current_section = 'action'
+                current_content = [line.replace('Action:', '').strip()]
+                
+            elif line.startswith('Reasoning:'):
+                # If no explicit thought found, use reasoning
+                if not thought:
+                    thought = line.replace('Reasoning:', '').strip()
+                    
+            elif line.startswith('Observation:') or line.startswith('Function call:'):
+                # End of current section
+                if current_section == 'thought' and current_content:
+                    thought = ' '.join(current_content).strip()
+                elif current_section == 'action' and current_content:
+                    action = ' '.join(current_content).strip()
+                current_section = None
+                current_content = []
+                
+            elif line and current_section:
+                # Continue current section
+                current_content.append(line)
+        
+        # Save final section
+        if current_section == 'thought' and current_content:
+            thought = ' '.join(current_content).strip()
+        elif current_section == 'action' and current_content:
+            action = ' '.join(current_content).strip()
+        
+        # Fallback: if no structured sections found, try simple parsing
+        if not thought and not action:
+            for line in lines:
+                line = line.strip()
+                if line.startswith('Thought:') and not thought:
+                    thought = line.replace('Thought:', '').strip()
+                elif line.startswith('Action:') and not action:
+                    action = line.replace('Action:', '').strip()
+                elif line.startswith('Reasoning:') and not thought:
+                    thought = line.replace('Reasoning:', '').strip()
+        
+        return thought, action
+    
     async def run_react_loop(self, goal: str) -> str:
         self.goal = goal
         self.current_step = 0
@@ -437,32 +756,31 @@ Generate the function call for the above text action:"""
         
         print(f"🎯 Starting ReAct agent with goal: {goal}")
         print("=" * 80)
-        # 1. OBSERVE
-        print("👁️  OBSERVING ORIGINAL SCENE...")
-        original_observation = await self.observe_scene(step=self.current_step)
-        print(f"📋 Original Observation: {original_observation}")
-        observation = original_observation
+        
+
+        
         while self.current_step < self.max_steps:
             self.current_step += 1
             print(f"\n🔄 STEP {self.current_step}/{self.max_steps}")
             print("=" * 50)
-            # 2. REASON & ACT
+            # Initialize with empty observation - agent will use observe_scene tool when needed
+            observation = "No initial observation - agent will use observe_scene tool when needed"
+            # REASON & ACT
             print("\n🧠 REASONING AND PLANNING ACTION...")
-            print(observation)
+            print(f"Current Observation: {observation}")
             prompt = self.create_react_prompt(observation)
             
             # Log the prompt being sent to the LLM
             print(f"\n📝 Sending prompt to LLM:")
             print("-" * 40)
-            #print(prompt)
             print("-" * 40)
             
             try:
                 response = self.reasoning_model.generate_content(
                     contents=prompt,
-                    tools=self.mcp_core.available_tools,
+                    tools=self.available_tools,  # Use the registered tools including observe_scene
                     generation_config=GenerationConfig(
-                        temperature=0.3,
+                        temperature=0.2,
                         max_output_tokens=2000,
                         top_p=0.95,
                         top_k=40,
@@ -470,66 +788,33 @@ Generate the function call for the above text action:"""
                     )
                 )
                 
-                # 3. HANDLE RESPONSE using the _handle_response method
-                print("\n🚀 HANDLING LLM RESPONSE...")
-                result = await self._handle_response(response) #self._extract_response_text(response) #await self._handle_response(response)
-                print(f"\n📊 ACTION RESULT: {result}")
-                print("👁️  OBSERVING MODIFIED SCENE...")
-                observation = await self.observe_scene(step=self.current_step+1)
-                print(f"📋 Observation: {observation}")
-                result = result + f"Observation of effect of action: {observation}"
-                
-                # Extract thought and action for memory (if available)
-                thought = ""
-                action = ""
-                
-                # Try to extract from the result first, then from the original response
-                response_text = result if result and result != "No valid response generated" else self._extract_response_text(response)
-                
-                if response_text and response_text != "No text content found in response" and response_text != "No valid response generated":
-                    # Parse the response text for thoughts and actions
-                    lines = response_text.split('\n')
-                    for line in lines:
-                        line = line.strip()
-                        if line.startswith('Thought:'):
-                            thought = line.replace('Thought:', '').strip()
-                        elif line.startswith('Action:'):
-                            action = line.replace('Action:', '').strip()
-                        elif line.startswith('Reasoning:'):
-                            # If no explicit thought found, use reasoning
-                            if not thought:
-                                thought = line.replace('Reasoning:', '').strip()
+                # Extract thought and action from the original LLM response BEFORE processing
+                response_text = self._extract_response_text(response)
+                thought, action = self._extract_thought_and_action(response_text)
                 
                 print(f"\n💭 EXTRACTED REASONING:")
-                print(f"   Thought: {thought}")
-                print(f"   Action: {action}")
+                print(f"   Thought: {thought[:200]}{'...' if len(thought) > 200 else ''}")
+                print(f"   Action: {action[:200]}{'...' if len(action) > 200 else ''}")
+                
+                # HANDLE RESPONSE using the _handle_response method
+                print("\n🚀 HANDLING LLM RESPONSE...")
+                result = await self._handle_response(response)
+                print(f"\n📊 ACTION RESULT: {result}")
                 
                 # Check if task is complete
                 if "TASK_COMPLETE" in result:
                     print("\n✅ TASK COMPLETE!")
                     print("=" * 80)
                     return f"Goal '{goal}' successfully completed in {self.current_step} steps!"
-                
-                # Error handling: if the action failed, log and continue
-                '''if "error" in result.lower() or "failed" in result.lower() or "no response" in result.lower():
-                    consecutive_failures += 1
-                    print(f"\n⚠️  ACTION FAILED. Consecutive failures: {consecutive_failures}/{max_consecutive_failures}")
-                    
-                    if consecutive_failures >= max_consecutive_failures:
-                        print(f"\n❌ MAXIMUM CONSECUTIVE FAILURES REACHED ({max_consecutive_failures}). Stopping execution.")
-                        return f"❌ Goal '{goal}' failed due to {max_consecutive_failures} consecutive failures. Final memory: {json.dumps(self.memory, indent=2)}"
-                else:
-                    consecutive_failures = 0  # Reset on success'''
-                
-                # 4. REFLECT
+
+                # REFLECT
                 print("\n🤔 REFLECTING ON RESULT...")
                 reflection = await self.reflect_on_result(action, result, observation)
                 print(f"💡 Reflection: {reflection}")
-                
-                # 5. STORE IN MEMORY
+
+                # STORE IN MEMORY
                 memory_entry = {
                     "step": self.current_step,
-                    "Original observation": original_observation,
                     "thought": thought,
                     "action": action,
                     "result": result,
@@ -538,14 +823,36 @@ Generate the function call for the above text action:"""
                 }
                 self.memory.append(memory_entry)
                 
-                # 6. CHECK GOAL COMPLETION
-                print("\n🎯 CHECKING GOAL COMPLETION...")
-                goal_achieved = await self.check_goal_completion(observation + "\n"+ reflection)
+                print(f"\n💾 MEMORY UPDATED - Step {self.current_step}:")
+                print(f"   Thought: {thought[:100]}{'...' if len(thought) > 100 else ''}")
+                print(f"   Action: {action[:100]}{'...' if len(action) > 100 else ''}")
+                print(f"   Memory entries: {len(self.memory)}")
                 
+                # Display recent memory entries for context
+                if len(self.memory) > 1:
+                    print(f"\n📚 RECENT MEMORY CONTEXT:")
+                    for i, entry in enumerate(self.memory[-3:], 1):
+                        print(f"   {len(self.memory)-3+i}. Step {entry['step']}: {entry['thought'][:50]}{'...' if len(entry['thought']) > 50 else ''}")
+
+                # CHECK GOAL COMPLETION - only if we have a recent observation
+                #if "Scene observation completed:" in result:
+                print("\n🎯 CHECKING GOAL COMPLETION...")
+                # Extract the observation from the result
+                #observation_lines = result.split("Scene observation completed:")
+                #if len(observation_lines) > 1:
+                #current_observation = observation_lines[1].strip()
+                goal_achieved = await self.check_goal_completion(result)
+
                 if goal_achieved:
                     print("\n✅ GOAL ACHIEVED!")
                     print("=" * 80)
                     return f"Goal '{goal}' successfully completed in {self.current_step} steps!"
+                
+                # Update observation for next iteration
+                if "Scene observation completed:" in result:
+                    observation_lines = result.split("Scene observation completed:")
+                    if len(observation_lines) > 1:
+                        observation = observation_lines[1].strip()
                 
                 print("\n⏭️  CONTINUING TO NEXT STEP...")
                 print("=" * 80)
@@ -680,39 +987,40 @@ Follow these guidelines:
                     return False
             else:
                 print("SceneRenderer GameObject found")
-            
+
             # Step 2: Enter Play mode for rendering using manage_editor
             print("Entering Play mode for scene rendering (manage_editor)...")
             play_mode_response = await self.session.call_tool("manage_editor", {
                 "action": "play"
             })
-            
+
             # Wait for Play mode to fully activate and SceneRenderer to execute
-            import asyncio
-            await asyncio.sleep(8)  # Give time for Play mode and rendering
-            
+
+            await asyncio.sleep(5)  # Give time for Play mode and rendering
+
             # Step 3: Exit Play mode after rendering using manage_editor
             print("Exiting Play mode (manage_editor)...")
             stop_mode_response = await self.session.call_tool("manage_editor", {
                 "action": "stop"
             })
-            
+            # Wait for Play mode to fully exit
+            await asyncio.sleep(5)  # Give time for Play mode to exit
             # Step 4: Find the most recent PNG file and rename it to the target filename
             import os
             import shutil
-            
+
             # Look for PNG files in the MCP_builder directory
             directory = "/Users/nmital/Unity projects/MCP_builder"
             if os.path.exists(directory):
                 files = os.listdir(directory)
                 png_files = [f for f in files if f.endswith('.png')]
-                
+
                 if png_files:
                     # Use the most recent PNG file
                     latest_file = max(png_files, key=lambda f: os.path.getmtime(os.path.join(directory, f)))
                     latest_path = os.path.join(directory, latest_file)
                     print(f"📁 Found latest PNG file: {latest_file}")
-                    
+
                     # Copy the file to the target filename
                     try:
                         shutil.copy2(latest_path, filename)
@@ -727,7 +1035,7 @@ Follow these guidelines:
             else:
                 print(f"❌ Directory not found: {directory}")
                 return False
-                
+
         except Exception as e:
             print(f"Error rendering scene: {e}")
             # Try to exit Play mode if we're still in it

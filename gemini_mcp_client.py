@@ -8,12 +8,10 @@ import uvicorn
 
 def main():
     if len(sys.argv) < 2:
-        # Default to the existing Unity MCP server
-        server_script = "/usr/local/bin/UnityMCP/UnityMcpServer/src/server.py"
-        print(f"Using default Unity MCP server: {server_script}")
-    else:
-        server_script = sys.argv[1]
-    
+        print("Usage: python gemini_mcp_client.py <path_to_server_script> [--gui|--web]")
+        sys.exit(1)
+
+    server_script = sys.argv[1]
     mode = next((arg for arg in sys.argv if arg in ['--gui', '--web']), '')
 
     if mode == '--web':
@@ -34,13 +32,13 @@ async def async_cli_main(server_script: str, core: MCPCore):
             return
 
         print("MCP Client Started! Type 'quit' to exit.")
-        while True:
+        '''while True:
             query = input("\nQuery: ").strip()
             if query.lower() == 'quit':
                 break
                 
             response = await core.process_request(query)
-            print("\nResponse:", response)
+            print("\nResponse:", response)'''
     finally:
         await core.cleanup()
 

@@ -50,13 +50,16 @@ class ReActAgent:
     def __init__(self, mcp_core: 'MCPCore'):
         self.mcp_core = mcp_core
         self.memory = []
-        self.max_steps = 20
+        self.max_steps = 50
         self.current_step = 0
         self.goal = ""
         self.vision_model = genai.GenerativeModel('models/gemini-2.5-flash')
         self.reasoning_model = genai.GenerativeModel('models/gemini-2.5-flash')
         self.function_call_model = genai.GenerativeModel('models/gemini-2.5-flash')  # Dedicated model for function call generation
         self.last_scene_path = None
+        self.user_suggestions = []  # Add field to store user suggestions
+        self.previous_scene_paths = []  # Add list to store previous scene paths
+        self.latest_scene_info = None  # Add field to store latest scene info
         # Register tools including observe_scene
         self._register_tools()
         
@@ -118,21 +121,25 @@ class ReActAgent:
             ]
         )
 
-        # Create the scene_info tool
+        # Create the ask_user tool with proper schema
         ask_user_tool = Tool(
             function_declarations=[
                 FunctionDeclaration(
                     name="ask_user",
                     description=(
-                        "Get input from user for a suggestion for next steps. "
-                        "This tool specifically asks the user for an prompt in between steps. "
-                        "Use this tool when you feel stuck or unable to get successful responses from the MCP server, and need help figuring out what to do."
+                        "Ask user for a suggestion when stuck or need guidance. "
+                        "Use this tool when you need help figuring out the next steps "
+                        "or when consistently unable to get successful responses from the server."
                     ),
                     parameters={
                         "type": "object",
                         "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The question or guidance needed from the user"
+                            }
                         },
-                        "required": []
+                        "required": ["query"]
                     }
                 )
             ]
@@ -157,15 +164,31 @@ class ReActAgent:
         if last_action:
             last_action_str = f"\nLast Action: {last_action.get('action', 'N/A')}\nLast Result: {last_action.get('result', 'N/A')}\n"
         
-        # Build the prompt using string concatenation to avoid formatting issues
-        tools_str = str(self.mcp_core.tools) if hasattr(self.mcp_core, 'tools') else "No tools available"
+        # Add user suggestions to the prompt
+        suggestions_str = ""
+        if self.user_suggestions:
+            suggestions_str = "\nUser Guidance:\n"
+            for suggestion in self.user_suggestions[-3:]:  # Show last 3 suggestions
+                suggestions_str += f"Step {suggestion['step']}: {suggestion['suggestion']}\n"
         
+        # Add scene info context if available
+        scene_info_str = ""
+        if self.latest_scene_info:
+            scene_info_str = "\nCurrent Scene Hierarchy:\n" + self.latest_scene_info
+
+        # Build the prompt using string concatenation to avoid formatting issues
+        self.tools_str = str(self.mcp_core.tools) if hasattr(self.mcp_core, 'tools') else "No tools available"
+        self.user_defined_tools = """ User-defined tools: 
+        - observe_scene: {"step": int} - Render and analyze the current Unity scene. Use this tool whenever you need to see the current state of the scene before or after an action.
+    - scene_info: {"name": str, "path": str} - Get complete scene information including hierarchy, objects, and their properties. Use this tool when you need to understand the current scene structure, object names, positions, and properties.
+    - ask_user: {} - Ask user for a suggestion on how to proceed. Use this tool when you are stuck and not able to understand what steps to perform next, or when consistently unable to get successful responses from the server."""
+        # {self.TOOL_SCHEMAS}
         prompt = f'''You are a ReAct-style reasoning agent for Unity scene manipulation. Your goal is to: {self.goal}
 
 Current Observation: {observation if observation else "No current observation - use observe_scene tool to see the current state"}
 {last_action_str}{memory_str}
-
-{self.TOOL_SCHEMAS}
+{suggestions_str}
+{scene_info_str}
 
 IMPORTANT: You MUST respond in this EXACT format:
 
@@ -177,7 +200,8 @@ Note that in your previous runs, you have used the wrong path to search for or c
 path Assets/ , but that actually takes you to the path Assets/Assets/ since you are already within the root Assets/ directory.
 Therefore, use the path / instead.
 
-Available MCP Tools: {tools_str}. Use the schemas of the tools as specified.
+Available MCP Tools: {self.tools_str + self.user_defined_tools}. Use ONLY the schemas of the tools as specified. DO NOT make up definitions of tools and their schemas if
+you get stuck. Try to find solutions within the tools provided.
 
 Guidelines:
 - ALWAYS start with "Thought:" to explain your reasoning
@@ -301,7 +325,7 @@ Action: manage_gameobject(action="create", name="TestCube", position={{"x": 0, "
 Function call: (Generate the function call to implement the above Action)
 Observation: [Wait for the result]
 
-The Unity scene uses an HDRP renderer, so all materials should have the HDRP/Lit shader. 
+The Unity scene is using the Universal Rendering Pipeline, so all materials should have the Universal Render Pipeline/Lit shader. 
 
 Begin your reasoning:'''
         return prompt
@@ -310,28 +334,88 @@ Begin your reasoning:'''
         """Render and analyze the current Unity scene as a tool."""
         try:
             # Render current scene
-            scene_path = f"/Users/nmital/Unity projects/MCP_builder/step_{step}_scene.png"
+            scene_path = f"/Users/nmital/Unity projects/MCP_builder3/step_{step}_scene.png"
             self.last_scene_path = scene_path
             success = await self.mcp_core.render_scene(scene_path)
             if not success:
                 return "Failed to render scene - cannot observe current state"
-            # Analyze the scene using vision
-            with open(scene_path, "rb") as img_file:
-                img_data = img_file.read()
-            img_part = {"mime_type": "image/png", "data": base64.b64encode(img_data).decode()}
-            analysis_prompt = f"""Analyze this Unity scene image and describe what you see.\n\nGoal: {self.goal}\n\nPlease describe:\n1. What objects are visible in the scene?\n2. What are their positions, colors, and states?\n3. How does this relate to the goal: {self.goal}?\n4. What needs to be changed to achieve the goal?\n\nProvide a clear, detailed observation that will help plan the next action."""
-            response = self.vision_model.generate_content([analysis_prompt, img_part])
+
+            # Store the path of the new image
+            self.previous_scene_paths.append(scene_path)
+            # Keep only the last 1 image
+            if len(self.previous_scene_paths) > 2:
+                self.previous_scene_paths.pop(0)
+
+            # Get context from recent actions
+            recent_context = ""
+            if self.memory:
+                recent_context = "\nRecent Actions Context:\n"
+                for entry in self.memory[-2:]:  # Last 1 action
+                    recent_context += f"Step {entry['step']}:\n"
+                    recent_context += f"- Thought: {entry.get('thought', 'N/A')}\n"
+                    recent_context += f"- Action: {entry.get('action', 'N/A')}\n"
+                    recent_context += f"- Result: {entry.get('result', 'N/A')}\n"
+                    if entry.get('reflection'):
+                        recent_context += f"- Reflection: {entry['reflection']}\n"
+
+            # Get user suggestions context
+            suggestions_context = ""
+            if self.user_suggestions:
+                suggestions_context = "\nUser Suggestions Context:\n"
+                for suggestion in self.user_suggestions[-2:]:  # Last 1 suggestion
+                    suggestions_context += f"Step {suggestion['step']}: {suggestion['suggestion']}\n"
+
+            # Prepare all available images for analysis
+            image_parts = []
+            for path in self.previous_scene_paths:
+                if os.path.exists(path):
+                    with open(path, "rb") as img_file:
+                        img_data = img_file.read()
+                        image_parts.append({
+                            "mime_type": "image/png",
+                            "data": base64.b64encode(img_data).decode()
+                        })
+
+            # Create the analysis prompt with temporal context
+            analysis_prompt = f"""Analyze these Unity scene images in the context of our actions and goal.
+
+Goal: {self.goal}
+{recent_context}
+{suggestions_context}
+
+You are looking at {len(image_parts)} images showing the progression of scene changes.
+{f'The images are ordered from oldest to newest, with the last image being the current state.' if len(image_parts) > 1 else 'This is the current state of the scene.'}
+
+Please provide a temporal analysis:
+1. What changes are visible in the scene across these images?
+2. How have our recent actions affected the scene?
+3. What progression do you see towards our goal?
+4. What modifications still need to be made?
+5. Are there any unintended changes or issues to address?
+6. How does the current state (last image) compare to previous states?
+
+Consider the sequence of changes when analyzing the current state. Explain how the scene has evolved through our modifications and what next steps would help achieve our goal.
+
+Provide a clear, detailed observation that will help plan the next action."""
+
+            response = self.vision_model.generate_content([analysis_prompt] + image_parts)
             return response.text
         except Exception as e:
             return f"Error observing scene: {str(e)}"
 
-    async def ask_user(self) -> str:
+    async def ask_user(self, query: str = "") -> str:
         """Ask user to provide a nudge in the correct or a desired direction of reasoning."""
         try:
-            # Take Input from user
-            print("\n🎯 I am stuck. Please suggest some ideas if you have of how I can proceed:")
+            # Take Input from user with the query as prompt
+            print(f"\n🎯 {query if query else 'I am stuck. Please suggest how I can proceed:'}")
             user_nudge = input("> ").strip()
-            return user_nudge
+            # Store the suggestion
+            self.user_suggestions.append({
+                "step": self.current_step,
+                "query": query,
+                "suggestion": user_nudge
+            })
+            return f"User suggestion: {user_nudge}"
         except Exception as e:
             return f"Error in user input: {str(e)}"
     
@@ -351,6 +435,8 @@ Begin your reasoning:'''
             
             if tool_response and tool_response.content:
                 response_text = tool_response.content[0].text
+                # Store the latest scene info
+                self.latest_scene_info = response_text
                 return f"Scene information retrieved successfully:\n{response_text}"
             else:
                 return "Failed to retrieve scene information - no response from manage_scene tool"
@@ -358,14 +444,13 @@ Begin your reasoning:'''
         except Exception as e:
             return f"Error retrieving scene info: {str(e)}"
     
-    async def reflect_on_result(self, action: str, result: str, observation: str) -> str:
+    async def reflect_on_result(self, action: str, result: str) -> str:
         """Use LLM to reflect on the action result and plan next steps."""
         reflection_prompt = f"""Reflect on the latest action and its result in context of the previous actions:
 
 Goal: {self.goal}
 Latest action taken: {action}
 Result of latest action: {result}
-Current observation: {observation}
 
 Previous actions: {json.dumps(self.memory[-3:], indent=2) if self.memory else "None"}
 
@@ -636,15 +721,13 @@ Provide a brief explanation for your assessment."""
         try:
             import re
             import json
-            
+            # Available MCP Tools and their schemas:
+            # {self.TOOL_SCHEMAS}
             # Create a prompt specifically for function call generation
             function_call_prompt = f"""You are a function call generator for Unity MCP tools. Your task is to convert a text action into a proper function call.
 
-Available MCP Tools and their schemas:
-{self.TOOL_SCHEMAS}
-
 Text Action: {action_text}
-
+Available tools: {self.tools_str + self.user_defined_tools}
 Instructions:
 1. Analyze the text action and identify which MCP tool should be called
 2. Extract the parameters from the text action
@@ -780,7 +863,7 @@ Generate the function call for the above text action:"""
                     contents=prompt,
                     tools=self.available_tools,  # Use the registered tools including observe_scene
                     generation_config=GenerationConfig(
-                        temperature=0.2,
+                        temperature=0.4,
                         max_output_tokens=2000,
                         top_p=0.95,
                         top_k=40,
@@ -809,7 +892,7 @@ Generate the function call for the above text action:"""
 
                 # REFLECT
                 print("\n🤔 REFLECTING ON RESULT...")
-                reflection = await self.reflect_on_result(action, result, observation)
+                reflection = await self.reflect_on_result(action, result)
                 print(f"💡 Reflection: {reflection}")
 
                 # STORE IN MEMORY
@@ -875,29 +958,20 @@ Generate the function call for the above text action:"""
         return f"❌ Goal '{goal}' not achieved within {self.max_steps} steps. Final memory: {json.dumps(self.memory, indent=2)}"
 
 class MCPCore:
+    # 1. FIRST: Render the current scene to 'current_scene.png' using Unity's SceneRenderer
+    # 4. RENDER: Render the modified scene to 'modified_scene.png' using Unity's SceneRenderer
+    # 5. COMPARE: Use Gemini Vision to compare the images and verify the changes
+
+    # - Always render scenes before and after modifications for visual verification
+
     SYSTEM_PROMPT = """System prompt: You are an expert in using the Unity game engine with visual feedback capabilities. Your overall task is to answer the query or task specified by the user within the Unity game-engine. You will use a step-by-step approach with visual verification:
 
-1. FIRST: Render the current scene to 'current_scene.png' using Unity's SceneRenderer
-2. REASON: Analyze the user's request and plan the necessary modifications
-3. EXECUTE: Use MCP tools to modify the Unity scene
-4. RENDER: Render the modified scene to 'modified_scene.png' using Unity's SceneRenderer
-5. COMPARE: Use Gemini Vision to compare the images and verify the changes
-6. EVALUATE: Determine if the desired effect has been achieved
-7. EXIT: If successful, output 'TASK_COMPLETE', otherwise continue with alternative approaches
-
-SCENE RENDERING INSTRUCTIONS:
-- To render a scene, you must:
-  1. Create or find a GameObject with a SceneRenderer component
-  2. Set the fileName property in the SceneRenderer component to the desired filename
-  3. Enter Play mode using {`action`: `play`} parameter within manage_editor tool.
-  4. Wait for the SceneRenderer to execute and save the image
-  5. Exit Play mode using {`action`: `stop`} parameter within manage_editor tool.
-- Use manage_gameobject tools to create/find SceneRenderer and set its properties
-- Use execute_menu_item to enter/exit Play mode
-- The rendered images will be saved to the specified filepaths
+1. REASON: Analyze the user's request and plan the necessary observations or modifications
+2. EXECUTE: Use MCP tools to modify the Unity scene
+3. EVALUATE: Determine if the desired effect has been achieved, by planning to observe the scene visually or its properties through the Unity editor
+4. EXIT: If successful, output 'TASK_COMPLETE', otherwise continue with alternative approaches
 
 Follow these guidelines:
-- Always render scenes before and after modifications for visual verification
 - Use chain-of-thought reasoning to break down complex operations
 - Verify each operation's success through visual comparison
 - Use precise coordinates and rotations
@@ -910,8 +984,8 @@ Follow these guidelines:
         self.exit_stack = AsyncExitStack()
         self.available_tools = []
         self.chat_history = []
-        self.original_scene_path = "/Users/nmital/Unity projects/MCP_builder/current_scene.png"
-        self.modified_scene_path = "/Users/nmital/Unity projects/MCP_builder/modified_scene.png"
+        self.original_scene_path = "/Users/nmital/Unity projects/MCP_builder3/current_scene.png"
+        self.modified_scene_path = "/Users/nmital/Unity projects/MCP_builder3/modified_scene.png"
         self.vision_model = genai.GenerativeModel('models/gemini-2.0-flash-exp')
 
     async def connect(self, server_path: str) -> bool:
@@ -970,7 +1044,7 @@ Follow these guidelines:
                     "name": "SceneRenderer",
                     "position": {"x": 0, "y": 0, "z": 0}
                 })
-                if create_response and create_response.content:
+                if (create_response and create_response.content):
                     print("SceneRenderer GameObject created")
                     # Add SceneRenderer component
                     component_response = await self.session.call_tool("manage_gameobject", {
@@ -978,7 +1052,7 @@ Follow these guidelines:
                         "objectName": "SceneRenderer",
                         "componentType": "SceneRenderer"
                     })
-                    if component_response and component_response.content:
+                    if (component_response and component_response.content):
                         print("SceneRenderer component added")
                     else:
                         print("Failed to add SceneRenderer component")
@@ -996,7 +1070,7 @@ Follow these guidelines:
 
             # Wait for Play mode to fully activate and SceneRenderer to execute
 
-            await asyncio.sleep(5)  # Give time for Play mode and rendering
+            await asyncio.sleep(10)  # Give time for Play mode and rendering
 
             # Step 3: Exit Play mode after rendering using manage_editor
             print("Exiting Play mode (manage_editor)...")
@@ -1010,7 +1084,7 @@ Follow these guidelines:
             import shutil
 
             # Look for PNG files in the MCP_builder directory
-            directory = "/Users/nmital/Unity projects/MCP_builder"
+            directory = "/Users/nmital/Unity projects/MCP_builder3"
             if os.path.exists(directory):
                 files = os.listdir(directory)
                 png_files = [f for f in files if f.endswith('.png')]
@@ -1139,3 +1213,19 @@ except Exception as e:
 except Exception as e:
 print(f"❌ Error converting text action to function call: {e}")
 return None'''
+
+
+'''
+Identify the object tag btr70 and all its components. I have already set the main camera to render as an infrared image by rendering it as a single red channel image.
+Modify the materials of the object components so that it resembles the infrared image of an actual btr70 vehicle, where the rear portion where the exhaust is located  appears bright/hot in the infrared image.
+'''
+
+'''
+Given that I have already set the main camera to render as an infrared image by rendering it as a grayscale image (where only the value of the red channel is rendered).
+Modify the materials of the object tagged btr70 and all its children so that it resembles the infrared image of an actual btr70 vehicle, where the rear portion where the exhaust is located  appears bright/hot in the infrared image.
+'''
+
+'''
+Generate multiple different images of the existing T72 object in the scene, where its individual children parts are ablated.
+ For each individual part, also change progressively their emission intensity in the red channel, so that they appear of different brightnesses when rendered. 
+'''

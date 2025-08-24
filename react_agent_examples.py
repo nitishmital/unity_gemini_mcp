@@ -8,6 +8,7 @@ import asyncio
 import sys
 import os
 from typing import List, Dict
+import base64
 
 # Add the current directory to the path so we can import mcp_core
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -132,8 +133,8 @@ class ReActAgentExamples:
         finally:
             await self.cleanup()
     
-    async def run_specific_example(self, example_number: int):
-        """Run a specific example by number."""
+    async def run_specific_example(self, example_number: int, attachments: List[Dict] = None):
+        """Run a specific example by number with optional attachments."""
         try:
             await self.setup()
             
@@ -147,7 +148,10 @@ class ReActAgentExamples:
             }
             
             if example_number in examples:
-                await examples[example_number]()
+                # Create example-specific attachments if needed
+                example_attachments = attachments or []
+                result = await self.mcp_core.run_react_agent(examples[example_number].__doc__, example_attachments)
+                print(f"\n📋 Result: {result}")
             else:
                 print(f"❌ Example {example_number} not found. Available examples: {list(examples.keys())}")
         
@@ -188,28 +192,58 @@ async def interactive_mode():
     print("✅ Connected to Unity MCP server")
     
     try:
+        overall_goal = ""
+        attachments = []
         while True:
-            print("\n🎯 Enter your goal (or 'help' for examples, 'quit' to exit):")
+            print("\n🎯 Enter your goal (or 'help' for examples, 'attach' to add attachments, 'quit' to exit):")
             goal = input("> ").strip()
             
             if goal.lower() == 'quit':
+                print("Quitting!")
+                return
+            elif goal.lower() == 'done':
                 break
             elif goal.lower() == 'help':
                 print("\n📚 Example goals:")
                 for i, example in enumerate(examples, 1):
                     print(f"{i}. {example}")
                 continue
+            elif goal.lower() == 'attach':
+
+                while True:
+                    print("\nEnter attachment path (or 'done' to finish):")
+                    path = input("> ").strip()
+                    if path.lower() == 'done':
+                        break
+                    
+                    if os.path.exists(path):
+                        print("Enter attachment description:")
+                        description = input("> ").strip()
+                        with open(path, "rb") as f:
+                            data = base64.b64encode(f.read()).decode()
+                        mime_type = "image/png" if path.endswith('.png') else "application/octet-stream"
+                        attachments.append({
+                            "data": data,
+                            "mime_type": mime_type,
+                            "description": description
+                        })
+                        print("✅ Attachment added")
+                    else:
+                        print("❌ File not found")
+                continue
             elif not goal:
                 continue
+            else:
+                overall_goal += goal
             
-            print(f"\n🚀 Running ReAct agent with goal: {goal}")
-            print("="*60)
+        print(f"\n🚀 Running ReAct agent with goal: {goal} and attachments: {attachments}")
+        print("="*60)
             
-            try:
-                result = await mcp_core.run_react_agent(goal)
-                print(f"\n📋 Result: {result}")
-            except Exception as e:
-                print(f"❌ Error: {e}")
+        try:
+            result = await mcp_core.run_react_agent(overall_goal, attachments)
+            print(f"\n📋 Result: {result}")
+        except Exception as e:
+            print(f"❌ Error: {e}")
     
     finally:
         await mcp_core.cleanup()
